@@ -27,10 +27,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Eddie0521/pi-profile.git"
+    "url": "git+https://github.com/saifymatteo/pi-profile.git"
   },
-  "homepage": "https://github.com/Eddie0521/pi-profile#readme",
+  "homepage": "https://github.com/saifymatteo/pi-profile#readme",
   "bugs": {
-    "url": "https://github.com/Eddie0521/pi-profile/issues"
+    "url": "https://github.com/saifymatteo/pi-profile/issues"
   }
 }
