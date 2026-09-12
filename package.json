@@ -2,6 +2,9 @@
   "name": "@saifymatteo/pi-profile",
   "version": "0.3.0",
   "description": "Prompt-inert runtime profiles for the Pi coding agent — model binding, skill restriction, and UI metadata in the same session, no restart needed.",
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",
