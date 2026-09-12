@@ -1,5 +1,5 @@
 import { readFile, writeFile, readdir, mkdir } from "node:fs/promises";
- import { homedir } from "node:os";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 
@@ -12,63 +12,27 @@ export interface ProfileModel {
 }
 
 /**
- * Configuration for a subagent defined inside a profile.
- * Maps to pi-subagents' agent .md frontmatter fields.
+ * A profile is a prompt-inert runtime identity: UI-only metadata, model
+ * binding, and 2-layer skill restriction. Nothing here can modify the
+ * system prompt — no code path exists that reads such a field.
+ *
+ * Unknown keys in profile JSON (including `$schema` and legacy keys such as
+ * `systemPrompt`, `sessionName`, `subagents`) are silently ignored: JSON
+ * parsing tolerates them and the narrowed type keeps them inert by
+ * construction.
  */
-export interface ProfileSubagent {
-	systemPrompt?: string;
-	description?: string;
-	/** Display name shown in agent lists (maps to display_name in .md) */
-	displayName?: string;
-	/** Model binding */
-	model?: ProfileModel;
-	/** Tool access rules for the subagent process */
-	tools?: {
-		whitelist?: string[];
-		blacklist?: string[];
-	};
-	/** Thinking level (maps to thinking in .md frontmatter) */
-	thinkingLevel?: string;
-	/** Skill names to load */
-	skills?: string[];
-	/** Extensions to inherit: true=all, false=none, string[]=specific */
-	extensions?: boolean | string[];
-	/** Extensions to exclude */
-	excludeExtensions?: string[];
-	/** Tools to explicitly disallow */
-	disallowedTools?: string[];
-	/** Max agentic turns (0=unlimited) */
-	maxTurns?: number;
-	/** Persist session across invocations */
-	persistSession?: boolean;
-	/** Custom session directory */
-	sessionDir?: string;
-	/** Prompt mode: replace (default) or append */
-	promptMode?: "replace" | "append";
-	/** Inherit parent conversation context */
-	inheritContext?: boolean;
-	/** Run in background by default */
-	runInBackground?: boolean;
-	/** Isolated context (no extension/MCP tools) */
-	isolated?: boolean;
-	/** Run in isolated git worktree */
-	isolation?: "worktree";
-	/** Memory scope for agent persistence */
-	memory?: "user" | "project" | "local";
-	/** Enable/disable this agent */
-	enabled?: boolean;
-}
-
 export interface Profile {
 	name: string;
+	/** Display label (emojis OK) — status bar, listings, autocomplete labels. */
 	label?: string;
+	/** One-line summary shown in profile listings. */
 	description?: string;
-	systemPrompt?: string;
+	/** Optional fixed model binding. */
 	model?: ProfileModel;
+	/** Allowed skills (undefined = no restriction). */
 	skills?: string[];
+	/** Prompt templates visible in autocomplete (undefined = all). */
 	prompts?: string[];
-	subagents?: Record<string, ProfileSubagent>;
-	sessionName?: string;
 }
 
 // ── Paths ──────────────────────────────────────────────────────────
@@ -160,4 +124,3 @@ export function resolveProfileName(
 	// 3. Saved .active file
 	return activeProfileNameSync();
 }
-

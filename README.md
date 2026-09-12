@@ -1,11 +1,8 @@
-<p align="right">
-  <a href="README_CN.md">🇨🇳 中文</a>
-</p>
+# @saifymatteo/pi-profile
 
-# pi-profile
-
-A pi extension for **instant identity switching** — swap model, skills,
-subagents, and system prompt in the same session, no restart needed.
+A pi extension for **prompt-inert runtime identity switching** — swap model
+binding and skill restrictions in the same session, no restart needed, with
+zero impact on the system prompt or the provider's prompt cache.
 
 ```bash
 /profile researcher          # switch to the researcher identity
@@ -16,12 +13,12 @@ pi --profile researcher      # start directly in a profile
 ## Install
 
 ```bash
-pi install npm:pi-profile
+pi install npm:@saifymatteo/pi-profile
 ```
 
-Example profiles (`default`, `researcher`) ship in the repo's [`profiles/`](profiles/)
-directory — copy them to `~/.pi/profiles/` to start, or build your own with
-`/profile create`.
+Example profiles (`default`, `researcher`) ship in the repo's
+[`profiles/`](profiles/) directory — copy them to `~/.pi/profiles/` to start,
+or build your own with `/profile create`.
 
 ## Quick start
 
@@ -38,15 +35,17 @@ pi --profile researcher
 
 ## How it works
 
-pi-profile hooks into pi's extension API to switch **runtime identity**:
+A profile is a **prompt-inert runtime identity**: model binding, 2-layer skill
+restriction, and UI-only metadata. Nothing else. No profile key can modify or
+append to the system prompt, because no code path exists that touches it —
+the guarantee is architectural, not input validation.
 
-| Layer | Mechanism | Effect |
-|-------|-----------|--------|
-| **Skills** | `before_agent_start` + `tool_call` | 3-layer hard block: skills outside profile are invisible to the LLM |
-| **Subagents** | Agent `.md` file sync | Profile-defined team members available for delegation |
-| **Prompt** | `before_agent_start` | Profile's system prompt injected each turn (append mode) |
-| **Model** | `pi.setModel()` | Different profiles use different models |
-| **Autocomplete** | `addAutocompleteProvider` | `/` only shows profile's skills and templates |
+| Concern | Mechanism | Effect |
+|---------|-----------|--------|
+| **Skills** | `tool_call` read interception | Reads of non-allowed `SKILL.md` files are blocked; the reason names the skill and the active profile |
+| **Skills** | `addAutocompleteProvider` | Non-allowed `/skill:` entries and prompt templates are filtered from autocomplete |
+| **Model** | `pi.setModel()` | Different profiles use different models; a mid-session switch that changes the model warns that it invalidates the provider's prompt cache |
+| **Metadata** | status bar, listings | `label` / `description` are shown only to humans — they never reach the LLM |
 
 > **Identity, not security.** Profile controls *who the AI is* — not what tools
 > it can use or what commands are dangerous. Tool access and security policies
@@ -60,19 +59,13 @@ Stored as `~/.pi/profiles/<name>.json`:
 {
   "name": "researcher",
   "label": "🔬 Deep Researcher",
-  "description": "Deep research mode with web search focus",
-
-  "systemPrompt": "你是一个严谨的研究助手。\n\n## 准则\n1. 每次回答必须附上来源链接\n2. 优先使用 web_search 验证事实\n3. 交叉验证多个来源后再得出结论\n4. 用结构化格式输出（列表、表格、摘要）\n5. 遇到不确定的，明确说明",
-
+  "description": "Deep research mode focused on web search and source synthesis",
   "model": {
     "provider": "opencode-go",
     "model": "kimi-k2.6",
     "thinkingLevel": "high"
   },
-
-  "skills": ["learn", "wiki-read", "wiki-write"],
-
-  "sessionName": "🔬 Research"
+  "skills": ["learn", "wiki-read", "wiki-write"]
 }
 ```
 
@@ -80,29 +73,41 @@ Stored as `~/.pi/profiles/<name>.json`:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `name` | `string` | Unique ID (lowercase, no spaces) |
-| `label` | `string?` | Display label (emojis OK) |
-| `description` | `string?` | One-line summary shown in profile list |
-| `systemPrompt` | `string?` | Appended to Pi's default system prompt each turn |
+| `name` | `string` | Unique ID (lowercase, no spaces); forced from the filename |
+| `label` | `string?` | Display label (emojis OK) — status bar and listings only |
+| `description` | `string?` | One-line summary shown in profile listings |
 | `model` | `{provider, model, thinkingLevel?}` | Optional fixed model binding |
-| `skills` | `string[]?` | Skills visible to LLM (undefined = all skills visible) |
+| `skills` | `string[]?` | Allowed skills (undefined = no restriction) |
 | `prompts` | `string[]?` | Prompt templates visible in autocomplete |
-| `subagents` | `Record<string, Subagent>` | Team members synced to Pi's agent system |
-| `sessionName` | `string?` | Auto-session label when using this profile |
 
-### Skill hard blocking (3 layers)
+Unknown keys — including `$schema` and legacy keys such as `systemPrompt`,
+`sessionName`, or `subagents` — are silently ignored and have no effect.
 
-When `skills` is set, non-listed skills are **completely invisible** to the LLM:
+### Skill restriction (2 layers)
+
+When `skills` is set, non-allowed skills are restricted **at use**:
 
 | Layer | What | How |
 |-------|------|-----|
-| 1 | System prompt | `<available_skills>` XML filtered — LLM never sees them listed |
-| 2 | Read interception | LLM calling `read()` on a non-profile SKILL.md is blocked |
-| 3 | Autocomplete | `/skill:<name>` doesn't appear in auto-complete |
+| 1 | Read interception | LLM calling `read()` on a non-allowed `SKILL.md` is blocked; the reason names the skill and the active profile |
+| 2 | Autocomplete | `/skill:<name>` and prompt templates outside the profile don't appear in suggestions |
 
-This means the LLM cannot know about, discover, or use skills outside the
-profile's scope. Skills still load at startup — profile controls *visibility*,
-not *availability*.
+The LLM may still see restricted skills listed in the prompt (pi lists them
+natively); enforcement happens when they are used. Path matching handles both
+per-directory (`skills/<name>/SKILL.md`) and flat (`skills/<name>.md`) layouts.
+
+### Prompt-cache stability
+
+The system prompt heads the provider's prompt-cache prefix. Because profiles
+never touch it:
+
+- **Mid-session switches keep the cached prompt prefix** — you don't re-pay
+  full input tokens after every switch.
+- The one exception is the model itself: switching to a different
+  provider+model invalidates the cache. That's a conscious decision, so a
+  warning notification fires — but only when the model actually changes.
+  Same-model switches, thinking-level-only changes, and launch-time
+  application (CLI flag, `PI_PROFILE`, saved state) stay silent.
 
 ## Commands
 
@@ -118,6 +123,17 @@ not *availability*.
 ## CLI
 
 ```bash
-pi --profile <name>       # Start with profile
+pi --profile <name>       # Start with profile (silent, cache is cold)
 PI_PROFILE=<name> pi      # Via environment variable
 ```
+
+## Credits
+
+This package is a hard fork of
+[pi-profile](https://github.com/Eddie0521/pi-profile) by
+[acumen7 (Eddie0521)](https://github.com/Eddie0521). The fork removes the
+system-prompt, session-name, and subagent-sync features in favor of
+prompt-inert profiles (see
+[ADR 0002](docs/adr/0002-prompt-inert-profiles.md) and
+[ADR 0003](docs/adr/0003-standalone-fork.md)), and is published under its own
+npm identity. Thank you to the original author for the foundation.

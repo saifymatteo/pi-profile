@@ -1,7 +1,7 @@
 {
-  "name": "pi-profile",
-  "version": "0.2.0",
-  "description": "Runtime profile switching for the Pi coding agent — swap model, skills, subagents, and system prompt in the same session, no restart needed.",
+  "name": "@saifymatteo/pi-profile",
+  "version": "0.3.0",
+  "description": "Prompt-inert runtime profiles for the Pi coding agent — model binding, skill restriction, and UI metadata in the same session, no restart needed.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -13,6 +13,10 @@
   "license": "MIT",
   "type": "module",
   "main": "index.ts",
+  "scripts": {
+    "test": "node --test \"test/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
   "pi": {
     "extensions": [
       "./index.ts"
@@ -23,7 +27,10 @@
     "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0"
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-tui": "0.85.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
   },
   "repository": {
     "type": "git",

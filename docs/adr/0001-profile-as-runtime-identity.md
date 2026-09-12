@@ -6,7 +6,15 @@ hard block, not just autocomplete filtering), subagent availability, model
 binding, system prompt, and session naming — but it does NOT control tool
 access, security permissions, or extension loading.
 
-*Status: Accepted (updated 2026-07-04)*
+*Status: Partially superseded by [ADR 0002](0002-prompt-inert-profiles.md) (updated 2026-09-12)*
+
+> **Partial supersession.** The identity-vs-security boundary (Option D) stands.
+> Two decisions in this ADR are **withdrawn** by ADR 0002: the three-layer skill
+> hard blocking (Layer 1 — system-prompt XML filtering — is replaced by
+> enforcement-at-use "Skill Restriction"; Layers 2–3 remain) and the
+> system-prompt append strategy (profiles are now prompt-inert and never touch
+> the system prompt). The subagent sync described below is also removed — see
+> [ADR 0003](0003-standalone-fork.md).
 
 ## Context
 

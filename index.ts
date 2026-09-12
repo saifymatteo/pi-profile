@@ -13,12 +13,6 @@ import {
 	ensureProfilesDir,
 } from "./profile-loader.ts";
 import { createProfileAutocomplete } from "./autocomplete.ts";
-import {
-	syncSubagents,
-	removeSubagents,
-	cleanupAllManaged,
-	formatSubagentList,
-} from "./subagent-sync.ts";
 import { writeFile, mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -27,27 +21,54 @@ import { homedir } from "node:os";
 
 let currentProfile: Profile | null = null;
 
+/**
+ * Last model this extension successfully applied via pi.setModel().
+ * Fallback for model-change detection when the live context carries no
+ * model; ctx.model is authoritative whenever it is present.
+ */
+let lastAppliedModel: { provider: string; model: string } | null = null;
+
 function getCurrentProfile(): Profile | null {
 	return currentProfile;
 }
 
+// ── Context shape (structural — satisfied by session and command ctx) ──
+
+interface ApplyContext {
+	waitForIdle?(): Promise<void>;
+	modelRegistry?: { find(provider: string, id: string): unknown };
+	/** Currently selected model (pi Model: { provider, id }). */
+	model?: { provider?: unknown; id?: unknown };
+	ui?: {
+		notify(msg: string, type?: string): void;
+		setStatus?(key: string, text: string | undefined): void;
+		setTitle?(title: string): void;
+	};
+}
+
+/** UI theme is not in the SDK types but may be present at runtime. */
+function uiTheme(ctx: ApplyContext | undefined): { fg(semantic: string, text: string): string } | undefined {
+	return (ctx?.ui as { theme?: { fg(semantic: string, text: string): string } } | undefined)?.theme;
+}
+
 // ── Profile application ────────────────────────────────────────────
 
+/**
+ * Apply a profile: skill restriction + UI immediately, model binding last.
+ *
+ * Profiles are prompt-inert: nothing here touches the system prompt, so a
+ * mid-session switch preserves the provider's prompt cache — except when the
+ * model itself changes (a hard cache boundary), which is called out with a
+ * warning.
+ *
+ * `launch` marks start-of-session application (CLI flag / env / saved state):
+ * silent, because the cache is cold anyway.
+ */
 async function applyProfile(
 	name: string,
 	pi: ExtensionAPI,
-	ctx?: {
-		waitForIdle?(): Promise<void>;
-		modelRegistry?: { find(provider: string, id: string): unknown };
-		ui?: {
-			notify(msg: string, type?: string): void;
-			setStatus(key: string, text: string | undefined): void;
-			setTitle(title: string): void;
-			theme: {
-				fg(semantic: string, text: string): string;
-			};
-		};
-	},
+	ctx?: ApplyContext,
+	opts?: { launch?: boolean },
 ): Promise<boolean> {
 	const profile = await loadProfile(name);
 	if (!profile) {
@@ -60,145 +81,111 @@ async function applyProfile(
 		await ctx.waitForIdle();
 	}
 
-	// 1. Model switching
-	await applyModelSettings(profile, pi, ctx);
-
-	// 2. Session name
-	applySessionName(profile, pi);
-
-	// 3. Cleanup previous profile's subagent files
-	if (currentProfile?.subagents) {
-		await removeSubagents(currentProfile.name);
-	}
-
-	// 4. Sync new profile's subagents to pi-subagents .md files
-	if (profile.subagents && Object.keys(profile.subagents).length > 0) {
-		const conflicts = await syncSubagents(profile);
-		if (conflicts.length > 0) {
-			ctx?.ui?.notify?.(
-				`⚠️ Subagent conflict: ${conflicts.join(", ")} already exist in agents/ and are not profile-managed. Skipping.`,
-				"warn",
-			);
-		} else {
-			const count = Object.keys(profile.subagents).length;
-			ctx?.ui?.notify?.(`📋 Synced ${count} subagent(s) to pi-subagents`, "info");
-		}
-	} else if (profile.subagents) {
-		// Profile has subagents field but all disabled / empty — ensure no stale files
-		await removeSubagents(profile.name);
-	}
-
-	// 5. Record switch in session
+	// 1. Record switch in session
 	pi.appendEntry("profile_switch", {
 		from: currentProfile?.name ?? "default",
 		to: name,
 		timestamp: Date.now(),
 	});
 
-	// 6. Persist active profile
+	// 2. Persist active profile
 	await setActiveProfileName(name);
 
-	// 7. Update state
+	// 3. Update state — drives skill restriction (tool_call) and
+	//    autocomplete filtering from this point on.
 	currentProfile = profile;
 
-	// 8. Show profile in status bar (compact, themed)
+	// 4. Show profile in status bar (compact)
 	const displayName = profile.label || profile.name;
-	const statusText = ctx?.ui?.theme
-		? ctx.ui.theme.fg("accent", displayName)
-		: displayName;
-	ctx?.ui?.setStatus("profile", statusText ?? displayName);
+	const theme = uiTheme(ctx);
+	const statusText = theme ? theme.fg("accent", displayName) : displayName;
+	ctx?.ui?.setStatus?.("profile", statusText);
 	ctx?.ui?.notify(`✅ Switched to ${displayName}`, "info");
+
+	// 5. Model binding last: skill restriction and UI updates land
+	//    immediately; the model change (the only cache-hostile part) is
+	//    applied after and warned about when it actually changes the model.
+	await applyModelSettings(profile, pi, ctx, opts?.launch ?? false);
 	return true;
 }
 
-// ── Extracted helper functions (reduce complexity) ─────────────────
+// ── Model binding ──────────────────────────────────────────────────
+
+/**
+ * The currently selected model as (provider, model id), read from the live
+ * extension context when available, falling back to the last model this
+ * extension applied.
+ *
+ * Read BEFORE pi.setModel() so a live ctx.model still reports the
+ * pre-switch model.
+ */
+function currentSelectedModel(ctx?: ApplyContext): { provider: string; model: string } | null {
+	const m = ctx?.model;
+	if (m && typeof m.provider === "string" && typeof m.id === "string") {
+		return { provider: m.provider, model: m.id };
+	}
+	return lastAppliedModel;
+}
 
 /**
  * Apply model and thinking level from a profile.
+ *
+ * Launch-time application is silent (the prompt cache is cold at startup).
+ * Mid-session, a warning fires when the target provider+model differs from
+ * the currently selected model — model identity is a hard cache boundary.
+ * Thinking-level-only deltas never warn. Re-applying the same model never
+ * warns.
  */
 async function applyModelSettings(
 	profile: Profile,
 	pi: ExtensionAPI,
-	ctx?: { modelRegistry?: { find(provider: string, id: string): unknown }; ui?: { notify(msg: string, type?: string): void } },
+	ctx?: ApplyContext,
+	launch = false,
 ): Promise<void> {
 	if (!profile.model?.provider || !profile.model?.model) return;
 
+	const target = { provider: profile.model.provider, model: profile.model.model };
+	const previous = currentSelectedModel(ctx);
+
 	// modelRegistry.find uses (provider, id) signature — see pi docs
-	const registry = ctx && "modelRegistry" in ctx
-		? (ctx as { modelRegistry: { find(provider: string, id: string): unknown } }).modelRegistry
-		: null;
+	const registry = ctx?.modelRegistry ?? null;
 	if (registry) {
 		try {
-			const model = registry.find(profile.model.provider, profile.model.model);
+			const model = registry.find(target.provider, target.model);
 			if (model) {
-				const ok = await pi.setModel(model);
-				if (!ok) {
-					ctx?.ui?.notify?.("⚠️ 切换模型失败：无有效 API key", "warn");
+				const ok = await pi.setModel(model as Parameters<typeof pi.setModel>[0]);
+				if (ok) {
+					lastAppliedModel = target;
+					if (!launch && (!previous || previous.provider !== target.provider || previous.model !== target.model)) {
+						ctx?.ui?.notify(
+							`⚠️ Model changed to ${target.provider}/${target.model} — this mid-session switch invalidates the provider's prompt cache for this conversation`,
+							"warning",
+						);
+					}
+					// Thinking level is part of the binding — apply only when the
+					// model actually switched, so a failed switch never half-applies.
+					if (profile.model.thinkingLevel) {
+						try {
+							const level = profile.model.thinkingLevel as "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+							pi.setThinkingLevel(level);
+						} catch { /* not supported by this model */ }
+					}
+				} else {
+					ctx?.ui?.notify("⚠️ Failed to switch model: no valid API key", "warning");
 				}
 			}
 		} catch {
-			ctx?.ui?.notify?.("⚠️ 切换模型失败：模型不可用", "warn");
+			ctx?.ui?.notify("⚠️ Failed to switch model: model unavailable", "warning");
 		}
 	}
-
-	if (profile.model.thinkingLevel) {
-		try {
-			const level = profile.model.thinkingLevel as "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-			pi.setThinkingLevel(level);
-		} catch { /* not supported by this model */ }
-	}
 }
 
-/**
- * Set session name from profile.
- */
-function applySessionName(profile: Profile, pi: ExtensionAPI): void {
-	const name = profile.sessionName ?? profile.label ?? profile.name;
-	pi.setSessionName(name);
-}
-
-// ── Skill hard-blocking helpers ────────────────────────────────────
+// ── Skill restriction helpers ──────────────────────────────────────
 
 /**
- * Layer 1: Filter the <available_skills> XML block in the system prompt
- * to only include skills listed in allowedSkills.
+ * Check if a read tool call targets a skill file outside the allowed list.
  *
- * Parses the XML with regex, removes non-matching <skill> entries,
- * and reconstructs the block. If no <available_skills> block is found
- * the prompt is returned unchanged.
- */
-function filterSkillsInPrompt(systemPrompt: string, allowedSkills: string[]): string {
-	const allowedSet = new Set(allowedSkills);
-
-	const blockRegex = /<available_skills>[\s\S]*?<\/available_skills>/;
-	const blockMatch = systemPrompt.match(blockRegex);
-	if (!blockMatch) return systemPrompt;
-
-	const originalBlock = blockMatch[0];
-
-	// Parse individual <skill> entries
-	const skillRegex = /<skill>[\s\S]*?<\/skill>/g;
-	const keptSkills: string[] = [];
-	let skillMatch: RegExpExecArray | null;
-	while ((skillMatch = skillRegex.exec(originalBlock)) !== null) {
-		const skillBlock = skillMatch[0];
-		const nameMatch = skillBlock.match(/<name>\s*([^<]+?)\s*<\/name>/);
-		if (nameMatch && allowedSet.has(nameMatch[1].trim())) {
-			keptSkills.push(skillBlock);
-		}
-	}
-
-	const newBlock = keptSkills.length > 0
-		? `<available_skills>\n${keptSkills.join('\n')}\n</available_skills>`
-		: '<available_skills>\n</available_skills>';
-
-	return systemPrompt.replace(originalBlock, newBlock);
-}
-
-/**
- * Layer 2: Check if a read tool call targets a non-profile SKILL.md file.
- *
- * Extracts the skill name from the path based on Pi's skill directory layout:
+ * Extracts the skill name from the path based on Pi's skill directory layouts:
  *   - [skills]/[name]/SKILL.md  → name from directory
  *   - [skills]/[name].md        → name from filename
  * Returns true if the path IS a skill file whose name is NOT in the allowed list.
@@ -216,7 +203,7 @@ function isNonProfileSkillPath(path: string, allowedSkills: string[]): boolean {
 
 	if (afterSkills.endsWith('/SKILL.md')) {
 		// Directory-based: skills/hunt/SKILL.md → "hunt"
-		skillName = afterSkills.split('/')[0];
+		skillName = afterSkills.split('/')[0] ?? null;
 	} else if (afterSkills.endsWith('.md') && !afterSkills.includes('/')) {
 		// Flat file: skills/hunt.md → "hunt"
 		skillName = afterSkills.replace(/\.md$/, '');
@@ -238,12 +225,14 @@ function extractSkillNameFromPath(path: string): string {
 	const afterSkills = normalizedPath.slice(skillsIndex + 8);
 
 	if (afterSkills.endsWith('/SKILL.md')) {
-		return afterSkills.split('/')[0];
+		return afterSkills.split('/')[0] ?? path;
 	} else if (afterSkills.endsWith('.md') && !afterSkills.includes('/')) {
 		return afterSkills.replace(/\.md$/, '');
 	}
 	return path;
 }
+
+// ── Status / listing handlers ──────────────────────────────────────
 
 /**
  * Show current profile status and available profiles list.
@@ -271,31 +260,33 @@ async function showProfileStatus(ctx: { ui: { notify(msg: string, type?: string)
 	lines.push("       /profile create ai    AI-guided creation");
 	lines.push("       /profile create manual  Step-by-step wizard");
 
-	// Append available subagents for current profile
-	if (current?.subagents) {
-		const subList = formatSubagentList(current);
-		if (subList) lines.push("", subList.trim());
-	}
-
 	ctx.ui.notify(lines.join("\n"), "info");
+}
+
+/**
+ * Wizard context (command-handler context narrowed to what the wizard uses).
+ */
+interface WizardContext {
+	waitForIdle?(): Promise<void>;
+	modelRegistry?: { find(provider: string, id: string): unknown };
+	model?: { provider?: unknown; id?: unknown };
+	ui: {
+		input(title: string, placeholder?: string): Promise<string | undefined>;
+		select(title: string, options: string[]): Promise<string | undefined>;
+		confirm(title: string, message: string): Promise<boolean>;
+		notify(msg: string, type?: string): void;
+		setStatus?(key: string, text: string | undefined): void;
+	};
 }
 
 /**
  * Handle /profile create — dual-path entry.
  * Shows a menu: [🤖 Create with pi] or [📝 Manual wizard].
  */
-async function handleCreateProfile(
-	pi: ExtensionAPI,
-	ctx: {
-		ui: {
-			select(title: string, options: string[]): Promise<string | undefined>;
-			notify(msg: string, type?: string): void;
-		};
-	},
-): Promise<void> {
+async function handleCreateProfile(pi: ExtensionAPI, ctx: WizardContext): Promise<void> {
 	const choice = await ctx.ui.select("How to create a profile?", [
 		"🤖  Create with pi — Describe your intent, I'll generate it",
-		"📝  Manual — Full step-by-step wizard covering all options",
+		"📝  Manual — Step-by-step wizard (identity, model, skills)",
 	]);
 
 	if (!choice) return;
@@ -303,7 +294,7 @@ async function handleCreateProfile(
 	if (choice.startsWith("🤖")) {
 		await handleCreateWithPi(ctx);
 	} else {
-		await handleManualCreate(pi, ctx as any);
+		await handleManualCreate(pi, ctx);
 	}
 }
 
@@ -325,40 +316,23 @@ async function handleCreateWithPi(ctx: {
 }
 
 /**
- * Path B: 📝 Manual — full 5-step interactive wizard.
- * Steps: 1) Identity, 2) System prompt, 3) Model binding, 4) Skills, 5) Session name.
+ * Path B: 📝 Manual — 3-step interactive wizard.
+ * Steps: 1) Identity, 2) Model binding, 3) Skills.
  */
-async function handleManualCreate(
-	pi: ExtensionAPI,
-	ctx: {
-		ui: {
-			input(title: string, placeholder?: string): Promise<string | undefined>;
-			editor(title: string, prefill?: string): Promise<string | undefined>;
-			select(title: string, options: string[]): Promise<string | undefined>;
-			confirm(title: string, message: string): Promise<boolean>;
-			notify(msg: string, type?: string): void;
-		};
-	},
-): Promise<void> {
-	// ── Step 1: Basic info ───────────────────────────────────────
-	const name = await ctx.ui.input("Step 1/5 — Profile name (required)", "e.g. code-reviewer");
+async function handleManualCreate(pi: ExtensionAPI, ctx: WizardContext): Promise<void> {
+	// ── Step 1: Identity ─────────────────────────────────────────
+	const name = await ctx.ui.input("Step 1/3 — Profile name (required)", "e.g. code-reviewer");
 	if (!name) return;
 
-	const label = await ctx.ui.input("Step 1/5 — Display label", `e.g. 🔬 ${name}`);
+	const label = await ctx.ui.input("Step 1/3 — Display label", `e.g. 🔬 ${name}`);
 	const description = await ctx.ui.input(
-		"Step 1/5 — Short description (shown in profile list)",
+		"Step 1/3 — Short description (shown in profile list)",
 		"e.g. Focused code review for Rust projects",
 	);
 
-	// ── Step 2: System prompt ────────────────────────────────────
-	const systemPrompt = await ctx.ui.editor(
-		"Step 2/5 — System prompt (optional)\nDefines the AI's role, tone, and behavior. Appended to Pi's default prompt each turn. Leave empty to inherit the default.",
-		"",
-	);
-
-	// ── Step 3: Model binding ────────────────────────────────────
+	// ── Step 2: Model binding ────────────────────────────────────
 	const bindModel = await ctx.ui.confirm(
-		"Step 3/5 — Model binding",
+		"Step 2/3 — Model binding",
 		"Bind a specific model + thinking level to this profile?",
 	);
 	let model: Profile["model"] = undefined;
@@ -380,10 +354,10 @@ async function handleManualCreate(
 		}
 	}
 
-	// ── Step 4: Skills binding ───────────────────────────────────
+	// ── Step 3: Skills restriction ───────────────────────────────
 	const bindSkills = await ctx.ui.confirm(
-		"Step 4/5 — Skills binding",
-		"Restrict which skills the LLM knows about? Non-selected skills become completely invisible.",
+		"Step 3/3 — Skills restriction",
+		"Restrict which skills this profile allows? Non-selected skills are hidden from autocomplete and blocked from being read.",
 	);
 	let skills: string[] | undefined = undefined;
 	if (bindSkills) {
@@ -396,21 +370,13 @@ async function handleManualCreate(
 		}
 	}
 
-	// ── Step 5: Session name ─────────────────────────────────────
-	const sessionName = await ctx.ui.input(
-		"Step 5/5 — Session name (optional)\nAuto-names sessions when using this profile.",
-		"",
-	);
-
 	// ── Build and write ──────────────────────────────────────────
 	const profile: Profile = {
 		name,
 		label: label || undefined,
 		description: description || undefined,
-		systemPrompt: systemPrompt || undefined,
 		model,
 		skills,
-		sessionName: sessionName || undefined,
 	};
 
 	const dir = join(homedir(), ".pi", "profiles");
@@ -425,7 +391,8 @@ async function handleManualCreate(
 		`Switch to profile '${name}' immediately?`,
 	);
 	if (switchNow) {
-		await applyProfile(name, pi, { ui: ctx.ui });
+		// Mid-session switch: model binding warns when the model changes.
+		await applyProfile(name, pi, ctx);
 	}
 }
 
@@ -471,7 +438,6 @@ async function handleRemoveProfile(name: string | undefined, ctx: { ui: { notify
 	}
 	try {
 		await unlink(join(homedir(), ".pi", "profiles", `${name}.json`));
-		await removeSubagents(name);
 		ctx.ui.notify(`🗑️ Profile '${name}' deleted`, "info");
 	} catch {
 		ctx.ui.notify(`❌ Profile '${name}' not found`, "error");
@@ -492,9 +458,6 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		await ensureProfilesDir();
 
-		// Clean up orphaned managed agent files (profile .json deleted while offline)
-		await cleanupAllManaged();
-
 		const flagValue = pi.getFlag("profile");
 		const profileName = resolveProfileName(flagValue);
 
@@ -508,13 +471,14 @@ export default function (pi: ExtensionAPI) {
 		const explicitlySpecified = explicitFlag || explicitEnv;
 
 		if (profileName !== "default" || explicitlySpecified) {
-			await applyProfile(profileName, pi, ctx);
+			// Launch-time application: silent — the prompt cache is cold at startup.
+			await applyProfile(profileName, pi, ctx, { launch: true });
 		} else {
 			currentProfile = null;
+			lastAppliedModel = null;
 			// Show default profile in status bar
-			const defaultText = ctx?.ui?.theme
-				? ctx.ui.theme.fg("accent", "⚡ Default")
-				: "⚡ Default";
+			const theme = (ctx?.ui as { theme?: { fg(semantic: string, text: string): string } } | undefined)?.theme;
+			const defaultText = theme ? theme.fg("accent", "⚡ Default") : "⚡ Default";
 			ctx?.ui?.setStatus("profile", defaultText ?? "⚡ Default");
 		}
 
@@ -580,7 +544,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// /profile <name> — switch to named profile
+			// /profile <name> — switch to named profile (mid-session)
 			const profile = await loadProfile(subcmd);
 			if (!profile) {
 				ctx.ui.notify(
@@ -594,39 +558,11 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── before_agent_start: inject profile system prompt ─
-	pi.on("before_agent_start", (event, _ctx) => {
-		const profile = getCurrentProfile();
-		if (!profile || profile.name === "default") return;
-
-		let systemPrompt = event.systemPrompt;
-
-		// Layer 1: Filter <available_skills> XML to only profile-allowed skills
-		if (profile.skills && profile.skills.length > 0) {
-			systemPrompt = filterSkillsInPrompt(systemPrompt, profile.skills);
-		}
-
-		// Build profile identity block (appended)
-		let profilePrompt = `\n\n---\n[${profile.label || profile.name}]\n`;
-		if (profile.systemPrompt) {
-			profilePrompt += profile.systemPrompt;
-		}
-		if (profile.description) {
-			profilePrompt += `\n\n${profile.description}`;
-		}
-
-		// Append available subagents info so LLM knows it can delegate
-		const subagentInfo = formatSubagentList(profile);
-		if (subagentInfo) {
-			profilePrompt += `\n${subagentInfo}`;
-		}
-
-		return {
-			systemPrompt: systemPrompt + profilePrompt,
-		};
-	});
-
-	// ── tool_call: Layer 2 — block read on non-profile skill files ──
+	// ── tool_call: block read on non-allowed skill files ─────────
+	//
+	// Enforcement happens at use, on every turn: the LLM may still see
+	// restricted skills listed in the prompt (pi lists them natively), but
+	// reads of their files are blocked here.
 	pi.on(
 		"tool_call",
 		(
@@ -652,7 +588,4 @@ export default function (pi: ExtensionAPI) {
 			return undefined;
 		},
 	);
-
-
 }
- 
